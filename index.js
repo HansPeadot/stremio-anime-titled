@@ -31,7 +31,7 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
@@ -74,7 +74,7 @@ async function anilist(query, variables) {
   throw new Error('AniList rate limited');
 }
 
-const LIST_FIELDS = `id idMal format status episodes averageScore genres seasonYear
+const LIST_FIELDS = `id idMal format status episodes averageScore genres seasonYear startDate { year month day }
   title { romaji english } coverImage { extraLarge large }
   nextAiringEpisode { episode timeUntilAiring } description(asHtml:false)`;
 
@@ -84,7 +84,7 @@ const PAGE_QUERY = `query ($page:Int,$perPage:Int,$sort:[MediaSort],$status:Medi
     season:$season, seasonYear:$seasonYear, genre:$genre, search:$search, isAdult:false) { ${LIST_FIELDS} } } }`;
 
 const META_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { ${LIST_FIELDS} bannerImage duration
-  startDate { year month day } studios(isMain:true) { nodes { name } }
+  studios(isMain:true) { nodes { name } }
   trailer { id site } streamingEpisodes { title thumbnail } airingSchedule(perPage:50) { nodes { episode airingAt } } } }`;
 
 // ---------- ID mapping (AniList <-> Kitsu) so stream addons work ----------
@@ -111,14 +111,16 @@ const pickTitle = t => (TITLE_LANG === 'romaji' ? t.romaji || t.english : t.engl
 const cleanDesc = d => (d || '').replace(/<[^>]+>/g, '').replace(/\n{3,}/g, '\n\n').trim();
 const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url');
 
-function badgeFor(m) {
-  if (m.nextAiringEpisode) {
-    const d = Math.floor(m.nextAiringEpisode.timeUntilAiring / 86400);
-    const h = Math.floor(m.nextAiringEpisode.timeUntilAiring / 3600);
-    return `EP ${m.nextAiringEpisode.episode} · ${d >= 1 ? d + 'd' : Math.max(h, 1) + 'h'}`;
-  }
-  if (m.averageScore) return `★ ${(m.averageScore / 10).toFixed(1)}`;
-  return '';
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function airingBadge(m) {
+  if (!m.nextAiringEpisode) return '';
+  const sec = m.nextAiringEpisode.timeUntilAiring, d = Math.floor(sec / 86400);
+  return `EP ${m.nextAiringEpisode.episode} · ${d >= 1 ? d + 'd' : Math.max(Math.floor(sec / 3600), 1) + 'h'}`;
+}
+function dateLabel(m) {
+  const sd = m.startDate || {};
+  if (!sd.year) return m.status === 'NOT_YET_RELEASED' ? 'TBA' : '';
+  return [sd.day && sd.month ? sd.day : null, sd.month ? MONTHS[sd.month - 1] : null, sd.year].filter(Boolean).join(' ');
 }
 
 function toMetaPreview(m, base, type) {
@@ -126,7 +128,8 @@ function toMetaPreview(m, base, type) {
   const img = m.coverImage.extraLarge || m.coverImage.large;
   return {
     id: stremioId(m.id), type, name: title,
-    poster: `${base}/poster/${b64({ t: title, i: img, b: badgeFor(m) })}.jpg`,
+    poster: `${base}/poster/${b64({ t: title, i: img, r: m.averageScore ? (m.averageScore / 10).toFixed(1) : '',
+      e: airingBadge(m), dt: dateLabel(m) })}.jpg`,
     posterShape: 'poster', genres: m.genres,
     description: cleanDesc(m.description),
     releaseInfo: m.seasonYear ? String(m.seasonYear) : undefined,
@@ -181,28 +184,42 @@ function fitTitle(text, width) {
   return { size: 24, lines: wrap(text, 24, width, 3).lines };
 }
 
-async function renderPoster({ t, i, b }) {
-  const W = 400, H = 600, pad = 22;
+async function renderPoster({ t, i, r, e, dt, b }) {
+  const W = 400, H = 600, pad = 22, FONT = 'DejaVu Sans, Inter, Arial, sans-serif';
   const coverBuf = Buffer.from(await (await fetch(i)).arrayBuffer());
   const { size, lines } = fitTitle(t, W - pad * 2);
   const lh = Math.round(size * 1.15);
-  const textTop = H - pad - lh * lines.length + size * 0.85;
-  const gradStart = Math.max(0, (H - pad - lh * lines.length - 120) / H);
-
+  const dateH = dt ? 34 : 0;
+  const titleBottom = H - pad - dateH;
+  const textTop = titleBottom - lh * lines.length + size * 0.85;
+  const gradStart = Math.max(0, (titleBottom - lh * lines.length - 120) / H);
   const tspans = lines.map((l, n) => `<tspan x="${pad}" y="${Math.round(textTop + n * lh)}">${esc(l)}</tspan>`).join('');
-  const badgeW = b ? Math.round(b.length * 13 + 28) : 0;
+
+  let top = '';
+  if (r) { // big rating, top-right
+    const label = `★ ${r}`, w = Math.round(label.length * 19 + 30);
+    top += `<rect x="${W - w - 12}" y="12" rx="18" width="${w}" height="52" fill="#000" fill-opacity="0.78"/>
+      <text x="${W - w / 2 - 12}" y="49" text-anchor="middle" font-family="${FONT}" font-size="32" font-weight="800"
+        fill="#FFC83D">${esc(label)}</text>`;
+  }
+  const ep = e || b;
+  if (ep) { // next episode countdown, top-left
+    const w = Math.round(ep.length * 12.5 + 26);
+    top += `<rect x="12" y="14" rx="14" width="${w}" height="36" fill="#7b5bf5" fill-opacity="0.92"/>
+      <text x="${12 + w / 2}" y="39" text-anchor="middle" font-family="${FONT}" font-size="19" font-weight="700"
+        fill="#fff">${esc(ep)}</text>`;
+  }
   const svg = `<svg width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg">
     <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
       <stop offset="${gradStart}" stop-color="#000" stop-opacity="0"/>
-      <stop offset="${Math.min(1, gradStart + 0.25)}" stop-color="#000" stop-opacity="0.75"/>
-      <stop offset="1" stop-color="#000" stop-opacity="0.95"/></linearGradient>
+      <stop offset="${Math.min(1, gradStart + 0.25)}" stop-color="#000" stop-opacity="0.78"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0.96"/></linearGradient>
       <filter id="s"><feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000" flood-opacity="0.9"/></filter></defs>
     <rect width="${W}" height="${H}" fill="url(#g)"/>
-    ${b ? `<rect x="${W - badgeW - 14}" y="14" rx="14" width="${badgeW}" height="36" fill="#000" fill-opacity="0.72"/>
-      <text x="${W - badgeW / 2 - 14}" y="39" text-anchor="middle" font-family="DejaVu Sans, Inter, Arial, sans-serif"
-        font-size="20" font-weight="700" fill="#fff">${esc(b)}</text>` : ''}
-    <text font-family="DejaVu Sans, Inter, Arial, sans-serif" font-size="${size}" font-weight="800"
-      fill="#fff" filter="url(#s)">${tspans}</text></svg>`;
+    ${top}
+    <text font-family="${FONT}" font-size="${size}" font-weight="800" fill="#fff" filter="url(#s)">${tspans}</text>
+    ${dt ? `<text x="${pad}" y="${H - pad - 4}" font-family="${FONT}" font-size="24" font-weight="600"
+      fill="#d8d8e0" filter="url(#s)">${esc(dt)}</text>` : ''}</svg>`;
 
   return sharp(coverBuf).resize(W, H, { fit: 'cover', position: 'attention' })
     .composite([{ input: Buffer.from(svg) }]).jpeg({ quality: 82 }).toBuffer();
