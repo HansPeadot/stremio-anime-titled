@@ -31,18 +31,18 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
-  resources: ['catalog', { name: 'meta', types: ['series', 'movie'], idPrefixes: ['kitsu:', 'anilist:'] }],
-  types: ['series', 'movie'],
+  resources: ['catalog', { name: 'meta', types: ['series', 'movie', 'anime'], idPrefixes: ['kitsu:', 'anilist:'] }],
+  types: ['anime', 'series', 'movie'],
   catalogs: [
     ...Object.entries(CATALOGS).map(([id, c]) => ({
-      type: c.type, id: 'al_' + id, name: c.name,
+      type: 'anime', id: 'al_' + id, name: c.name,
       extra: [{ name: 'genre', options: GENRES }, { name: 'skip' }],
     })),
-    { type: 'series', id: 'al_search', name: 'Anime Search', extra: [{ name: 'search', isRequired: true }] },
+    { type: 'anime', id: 'al_search', name: 'Anime Search', extra: [{ name: 'search', isRequired: true }] },
   ],
   behaviorHints: { configurable: false },
 };
@@ -228,7 +228,7 @@ app.get('/catalog/:type/:id{/:extra}', async (req, res) => {
     const id = req.params.id.replace(/\.json$/, '');
     const extra = parseExtra(req.params.extra);
     const page = Math.round((+extra.skip || 0) / PER_PAGE) + 1; // tolerant of de-duplicated pages
-    let vars, type = req.params.type;
+    let vars, type = 'series';
     if (id === 'al_search') {
       if (!extra.search) return res.json({ metas: [] });
       vars = { search: extra.search, sort: ['SEARCH_MATCH'] };
