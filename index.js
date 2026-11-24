@@ -31,7 +31,7 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
@@ -85,20 +85,26 @@ const PAGE_QUERY = `query ($page:Int,$perPage:Int,$sort:[MediaSort],$status:Medi
 
 const META_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { ${LIST_FIELDS} bannerImage duration
   startDate { year month day } studios(isMain:true) { nodes { name } }
-  trailer { id site } airingSchedule(perPage:50) { nodes { episode airingAt } } } }`;
+  trailer { id site } streamingEpisodes { title thumbnail } airingSchedule(perPage:50) { nodes { episode airingAt } } } }`;
 
 // ---------- ID mapping (AniList <-> Kitsu) so stream addons work ----------
-let alToKitsu = new Map(), kitsuToAl = new Map();
+let alToKitsu = new Map(), kitsuToAl = new Map(), alToImdb = new Map();
 async function loadMapping() {
   try {
     const list = await (await fetch(MAPPING_URL)).json();
-    const a = new Map(), k = new Map();
-    for (const e of list) if (e.anilist_id && e.kitsu_id) { a.set(e.anilist_id, e.kitsu_id); k.set(e.kitsu_id, e.anilist_id); }
-    alToKitsu = a; kitsuToAl = k;
+    const a = new Map(), k = new Map(), im = new Map();
+    for (const e of list) {
+      if (!e.anilist_id) continue;
+      if (e.kitsu_id) { a.set(e.anilist_id, e.kitsu_id); k.set(e.kitsu_id, e.anilist_id); }
+      const imdb = Array.isArray(e.imdb_id) ? e.imdb_id[0] : e.imdb_id;
+      if (imdb && /^tt\d+$/.test(imdb)) im.set(e.anilist_id, imdb);
+    }
+    alToKitsu = a; kitsuToAl = k; alToImdb = im;
     console.log(`Loaded ${a.size} AniList→Kitsu mappings`);
   } catch (e) { console.error('Mapping load failed:', e.message); }
 }
-const stremioId = al => (alToKitsu.has(al) ? `kitsu:${alToKitsu.get(al)}` : `anilist:${al}`);
+// IMDb first: Stremio then opens the full show (all seasons, episode thumbnails) via Cinemeta.
+const stremioId = al => alToImdb.get(al) || (alToKitsu.has(al) ? `kitsu:${alToKitsu.get(al)}` : `anilist:${al}`);
 
 // ---------- helpers ----------
 const pickTitle = t => (TITLE_LANG === 'romaji' ? t.romaji || t.english : t.english || t.romaji) || '';
@@ -221,7 +227,7 @@ app.get('/catalog/:type/:id{/:extra}', async (req, res) => {
   try {
     const id = req.params.id.replace(/\.json$/, '');
     const extra = parseExtra(req.params.extra);
-    const page = Math.floor((+extra.skip || 0) / PER_PAGE) + 1;
+    const page = Math.round((+extra.skip || 0) / PER_PAGE) + 1; // tolerant of de-duplicated pages
     let vars, type = req.params.type;
     if (id === 'al_search') {
       if (!extra.search) return res.json({ metas: [] });
@@ -235,7 +241,9 @@ app.get('/catalog/:type/:id{/:extra}', async (req, res) => {
     vars.page = page; vars.perPage = PER_PAGE;
     const data = await cached('cat:' + JSON.stringify(vars), 30 * 60e3, () => anilist(PAGE_QUERY, vars));
     const base = baseUrl(req);
-    const metas = data.Page.media.map(m => toMetaPreview(m, base, m.format === 'MOVIE' ? 'movie' : type));
+    const seen = new Set();
+    const metas = data.Page.media.map(m => toMetaPreview(m, base, m.format === 'MOVIE' ? 'movie' : type))
+      .filter(x => !seen.has(x.id) && seen.add(x.id)); // seasons of one show share an IMDb id
     res.setHeader('Cache-Control', 'max-age=1800');
     res.json({ metas });
   } catch (e) { console.error(e); res.json({ metas: [] }); }
@@ -263,10 +271,16 @@ app.get('/meta/:type/:id.json', async (req, res) => {
     if (meta.type === 'series') {
       const aired = new Map((m.airingSchedule?.nodes || []).map(n => [n.episode, n.airingAt]));
       const count = m.episodes || (m.nextAiringEpisode ? m.nextAiringEpisode.episode - 1 : aired.size) || 1;
+      const thumbs = new Map();
+      for (const se of m.streamingEpisodes || []) {
+        const n = +(se.title.match(/^Episode\s+(\d+)/i) || [])[1];
+        if (n && !thumbs.has(n)) thumbs.set(n, { thumb: se.thumbnail, name: se.title.replace(/^Episode\s+\d+\s*[-:–]\s*/i, '') });
+      }
       meta.videos = Array.from({ length: count }, (_, k) => {
-        const ep = k + 1;
+        const ep = k + 1, t = thumbs.get(ep);
         return {
-          id: `${id}:${ep}`, title: `Episode ${ep}`, season: 1, episode: ep,
+          id: `${id}:${ep}`, title: t?.name || `Episode ${ep}`, season: 1, episode: ep,
+          thumbnail: t?.thumb || meta.background,
           released: new Date(aired.has(ep) ? aired.get(ep) * 1000 : meta.released || Date.now()).toISOString(),
         };
       });
