@@ -120,7 +120,7 @@ function airingBadge(m) {
 function dateLabel(m) {
   const sd = m.startDate || {};
   if (!sd.year) return m.status === 'NOT_YET_RELEASED' ? 'TBA' : '';
-  return [sd.day && sd.month ? sd.day : null, sd.month ? MONTHS[sd.month - 1] : null, sd.year].filter(Boolean).join(' ');
+  return String(sd.year);
 }
 
 function toMetaPreview(m, base, type) {
