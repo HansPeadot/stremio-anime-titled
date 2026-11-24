@@ -31,13 +31,12 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '1.5.0',
+  version: '2.0.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
   resources: ['catalog',
-    { name: 'stream', types: ['series', 'movie', 'anime'], idPrefixes: ['tt', 'kitsu:', 'anilist:'] },
-    { name: 'meta', types: ['series', 'movie', 'anime'], idPrefixes: ['kitsu:', 'anilist:'] }],
+    { name: 'meta', types: ['series', 'movie', 'anime'], idPrefixes: ['atp:', 'kitsu:', 'anilist:'] }],
   types: ['anime', 'series', 'movie'],
   catalogs: [
     ...Object.entries(CATALOGS).map(([id, c]) => ({
@@ -112,7 +111,9 @@ async function loadMapping() {
   } catch (e) { console.error('Mapping load failed:', e.message); }
 }
 // IMDb first: Stremio then opens the full show (all seasons, episode thumbnails) via Cinemeta.
-const stremioId = al => alToImdb.get(al) || (alToKitsu.has(al) ? `kitsu:${alToKitsu.get(al)}` : `anilist:${al}`);
+// Our own id prefix ("atp:") so this addon serves the show page and can add a "Similar Anime" section.
+// Episodes inside still use IMDb/Kitsu ids, so stream addons (Torrentio etc.) keep working.
+const stremioId = al => (alToImdb.has(al) ? `atp:${alToImdb.get(al)}` : `atp:al${al}`);
 
 // ---------- helpers ----------
 const pickTitle = t => (TITLE_LANG === 'romaji' ? t.romaji || t.english : t.english || t.romaji) || '';
@@ -291,89 +292,103 @@ app.get('/catalog/:type/:id{/:extra}', async (req, res) => {
   } catch (e) { console.error(e); res.json({ metas: [] }); }
 });
 
+async function buildAnilistMeta(alId, id, base, videoPrefix) {
+  const { Media: m } = await cached('meta:' + alId, 60 * 60e3, () => anilist(META_QUERY, { id: alId }));
+  const meta = toMetaPreview(m, base, m.format === 'MOVIE' ? 'movie' : 'series');
+  meta.id = id;
+  meta.background = m.bannerImage || m.coverImage.extraLarge;
+  meta.runtime = m.duration ? `${m.duration} min` : undefined;
+  if (m.startDate?.year) meta.released = new Date(Date.UTC(m.startDate.year, (m.startDate.month || 1) - 1, m.startDate.day || 1)).toISOString();
+  const studio = m.studios?.nodes?.[0]?.name;
+  if (studio) meta.director = [studio];
+  if (m.trailer?.site === 'youtube') meta.trailers = [{ source: m.trailer.id, type: 'Trailer' }];
+  if (meta.type === 'movie') {
+    meta.behaviorHints = { defaultVideoId: videoPrefix.replace(/:1$/, '') };
+    return meta;
+  }
+  const aired = new Map((m.airingSchedule?.nodes || []).map(n => [n.episode, n.airingAt]));
+  const count = m.episodes || (m.nextAiringEpisode ? m.nextAiringEpisode.episode - 1 : aired.size) || 1;
+  const thumbs = new Map();
+  for (const se of m.streamingEpisodes || []) {
+    const n = +(se.title.match(/^Episode\s+(\d+)/i) || [])[1];
+    if (n && !thumbs.has(n)) thumbs.set(n, { thumb: se.thumbnail, name: se.title.replace(/^Episode\s+\d+\s*[-:–]\s*/i, '') });
+  }
+  meta.videos = Array.from({ length: count }, (_, k) => {
+    const ep = k + 1, t = thumbs.get(ep);
+    return {
+      id: `${videoPrefix}:${ep}`, title: t?.name || `Episode ${ep}`, season: 1, episode: ep,
+      thumbnail: t?.thumb || meta.background,
+      released: new Date(aired.has(ep) ? aired.get(ep) * 1000 : meta.released || Date.now()).toISOString(),
+    };
+  });
+  return meta;
+}
+
+async function cinemeta(type, imdb) {
+  return cached(`cm:${type}:${imdb}`, 6 * 3600e3, async () => {
+    const r = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${imdb}.json`);
+    if (!r.ok) return null;
+    return (await r.json()).meta || null;
+  });
+}
+
+// ---------- "Similar Anime" (AniList community recommendations) ----------
+const SIMILAR_QUERY = `query ($search:String) { Page(perPage:1) { media(type:ANIME, search:$search, sort:[SEARCH_MATCH, POPULARITY_DESC], isAdult:false) {
+  id recommendations(sort:RATING_DESC, perPage:25) { nodes { rating mediaRecommendation { isAdult ${LIST_FIELDS} } } } } } }`;
+const RECS_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { recommendations(sort:RATING_DESC, perPage:16) {
+  nodes { rating mediaRecommendation { id format isAdult averageScore seasonYear title { romaji english } } } } } }`;
+
+async function similarLinks(alId) {
+  const data = await cached('recs:' + alId, 12 * 3600e3, () => anilist(RECS_QUERY, { id: alId }));
+  const seen = new Set([stremioId(alId)]), links = [];
+  for (const n of data.Media?.recommendations?.nodes || []) {
+    const m = n.mediaRecommendation;
+    if (!m || m.isAdult || n.rating <= 0) continue;
+    const id = stremioId(m.id);
+    if (seen.has(id)) continue; // other seasons of the same show
+    seen.add(id);
+    const score = m.averageScore ? ` ★${(m.averageScore / 10).toFixed(1)}` : '';
+    links.push({
+      name: `${pickTitle(m.title)}${score}`, category: 'Similar Anime',
+      url: `stremio:///detail/${m.format === 'MOVIE' ? 'movie' : 'series'}/${encodeURIComponent(id)}`,
+    });
+    if (links.length >= 10) break;
+  }
+  return links;
+}
+
 app.get('/meta/:type/:id.json', async (req, res) => {
   try {
-    const { id } = req.params;
-    let alId;
-    if (id.startsWith('kitsu:')) alId = kitsuToAl.get(+id.split(':')[1]);
-    else if (id.startsWith('anilist:')) alId = +id.split(':')[1];
-    if (!alId) return res.json({ meta: null });
+    const { id } = req.params, base = baseUrl(req);
+    let meta = null, alId;
 
-    const { Media: m } = await cached('meta:' + alId, 60 * 60e3, () => anilist(META_QUERY, { id: alId }));
-    const base = baseUrl(req);
-    const meta = toMetaPreview(m, base, m.format === 'MOVIE' ? 'movie' : 'series');
-    meta.id = id;
-    meta.background = m.bannerImage || m.coverImage.extraLarge;
-    meta.runtime = m.duration ? `${m.duration} min` : undefined;
-    if (m.startDate?.year) meta.released = new Date(Date.UTC(m.startDate.year, (m.startDate.month || 1) - 1, m.startDate.day || 1)).toISOString();
-    const studio = m.studios?.nodes?.[0]?.name;
-    if (studio) meta.director = [studio];
-    if (m.trailer?.site === 'youtube') meta.trailers = [{ source: m.trailer.id, type: 'Trailer' }];
-
-    if (meta.type === 'series') {
-      const aired = new Map((m.airingSchedule?.nodes || []).map(n => [n.episode, n.airingAt]));
-      const count = m.episodes || (m.nextAiringEpisode ? m.nextAiringEpisode.episode - 1 : aired.size) || 1;
-      const thumbs = new Map();
-      for (const se of m.streamingEpisodes || []) {
-        const n = +(se.title.match(/^Episode\s+(\d+)/i) || [])[1];
-        if (n && !thumbs.has(n)) thumbs.set(n, { thumb: se.thumbnail, name: se.title.replace(/^Episode\s+\d+\s*[-:–]\s*/i, '') });
+    if (id.startsWith('atp:tt')) {
+      const imdb = id.slice(4);
+      alId = imdbToAl.get(imdb)?.al;
+      const cm = await cinemeta(req.params.type === 'movie' ? 'movie' : 'series', imdb).catch(() => null);
+      if (cm) {
+        meta = { ...cm, id, links: [...(cm.links || [])] };
+        if (cm.type === 'movie') meta.behaviorHints = { ...(cm.behaviorHints || {}), defaultVideoId: imdb };
+      } else if (alId) {
+        meta = await buildAnilistMeta(alId, id, base, `${imdb}:1`);
       }
-      meta.videos = Array.from({ length: count }, (_, k) => {
-        const ep = k + 1, t = thumbs.get(ep);
-        return {
-          id: `${id}:${ep}`, title: t?.name || `Episode ${ep}`, season: 1, episode: ep,
-          thumbnail: t?.thumb || meta.background,
-          released: new Date(aired.has(ep) ? aired.get(ep) * 1000 : meta.released || Date.now()).toISOString(),
-        };
-      });
+    } else if (id.startsWith('atp:al')) {
+      alId = +id.slice(6);
+      const k = alToKitsu.get(alId);
+      meta = await buildAnilistMeta(alId, id, base, k ? `kitsu:${k}` : id);
+    } else if (id.startsWith('kitsu:') || id.startsWith('anilist:')) { // older library items
+      alId = id.startsWith('kitsu:') ? kitsuToAl.get(+id.split(':')[1]) : +id.split(':')[1];
+      if (alId) meta = await buildAnilistMeta(alId, id, base, id);
+    }
+    if (!meta) return res.json({ meta: null });
+
+    if (alId) {
+      const sim = await similarLinks(alId).catch(e => { console.error(e.message); return []; });
+      meta.links = [...(meta.links || []), ...sim];
     }
     res.setHeader('Cache-Control', 'max-age=3600');
     res.json({ meta });
   } catch (e) { console.error(e); res.json({ meta: null }); }
-});
-
-const SIMILAR_QUERY = `query ($search:String) { Page(perPage:1) { media(type:ANIME, search:$search, sort:[SEARCH_MATCH, POPULARITY_DESC], isAdult:false) {
-  id recommendations(sort:RATING_DESC, perPage:25) { nodes { rating mediaRecommendation { isAdult ${LIST_FIELDS} } } } } } }`;
-
-// ---------- "Similar" picks, shown in the stream list ----------
-const RECS_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { recommendations(sort:RATING_DESC, perPage:12) {
-  nodes { rating mediaRecommendation { id format isAdult averageScore genres seasonYear startDate { year }
-    title { romaji english } } } } } }`;
-
-function anilistIdFor(id) {
-  const [prefix, num] = id.split(':');
-  if (id.startsWith('tt')) return imdbToAl.get(prefix)?.al;
-  if (prefix === 'kitsu') return kitsuToAl.get(+num);
-  if (prefix === 'anilist') return +num;
-}
-
-app.get('/stream/:type/:id.json', async (req, res) => {
-  try {
-    const alId = anilistIdFor(req.params.id);
-    if (!alId) return res.json({ streams: [] });
-    const data = await cached('recs:' + alId, 12 * 3600e3, () => anilist(RECS_QUERY, { id: alId }));
-    const seen = new Set([stremioId(alId)]);
-    const streams = [];
-    for (const n of data.Media?.recommendations?.nodes || []) {
-      const m = n.mediaRecommendation;
-      if (!m || m.isAdult || n.rating <= 0) continue;
-      const id = stremioId(m.id);
-      if (seen.has(id)) continue; // skip other seasons of the same show
-      seen.add(id);
-      const type = m.format === 'MOVIE' ? 'movie' : 'series';
-      const year = m.startDate?.year || m.seasonYear;
-      const info = [m.averageScore ? `★ ${(m.averageScore / 10).toFixed(1)}` : null, year, (m.genres || []).slice(0, 3).join(', ')]
-        .filter(Boolean).join(' · ');
-      const text = `${pickTitle(m.title)}\n${info}`;
-      streams.push({
-        name: '🔎 Similar', title: text, description: text,
-        externalUrl: `stremio:///detail/${type}/${encodeURIComponent(id)}`,
-      });
-      if (streams.length >= 8) break;
-    }
-    res.setHeader('Cache-Control', 'max-age=43200');
-    res.json({ streams });
-  } catch (e) { console.error(e); res.json({ streams: [] }); }
 });
 
 app.get('/poster/:data.jpg', async (req, res) => {
