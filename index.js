@@ -101,9 +101,13 @@ async function loadMapping() {
       const imdb = Array.isArray(e.imdb_id) ? e.imdb_id[0] : e.imdb_id;
       if (imdb && /^tt\d+$/.test(imdb)) {
         im.set(e.anilist_id, imdb);
-        // for a show with several seasons, keep the earliest season as its "main" AniList entry
-        const season = e.season?.tvdb ?? e.season?.tmdb ?? 1, cur = ia.get(imdb);
-        if (!cur || season < cur.season) ia.set(imdb, { al: e.anilist_id, season });
+        // pick the "main" AniList entry for a show: prefer TV/ONA/movie over specials/OVAs,
+        // then the earliest real season (season 0 = specials goes last)
+        const typeRank = { TV: 0, ONA: 1, MOVIE: 1 }[e.type] ?? 2;
+        const season = e.season?.tvdb ?? e.season?.tmdb ?? 1;
+        const rank = typeRank * 1000 + (season >= 1 ? season : 999);
+        const cur = ia.get(imdb);
+        if (!cur || rank < cur.rank) ia.set(imdb, { al: e.anilist_id, rank });
       }
     }
     alToKitsu = a; kitsuToAl = k; alToImdb = im; imdbToAl = ia;
