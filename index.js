@@ -31,11 +31,13 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '1.3.0',
+  version: '1.4.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
-  resources: ['catalog', { name: 'meta', types: ['series', 'movie', 'anime'], idPrefixes: ['kitsu:', 'anilist:'] }],
+  resources: ['catalog',
+    { name: 'stream', types: ['series', 'movie', 'anime'], idPrefixes: ['tt', 'kitsu:', 'anilist:'] },
+    { name: 'meta', types: ['series', 'movie', 'anime'], idPrefixes: ['kitsu:', 'anilist:'] }],
   types: ['anime', 'series', 'movie'],
   catalogs: [
     ...Object.entries(CATALOGS).map(([id, c]) => ({
@@ -88,18 +90,23 @@ const META_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { ${LIST_FIELDS}
   trailer { id site } streamingEpisodes { title thumbnail } airingSchedule(perPage:50) { nodes { episode airingAt } } } }`;
 
 // ---------- ID mapping (AniList <-> Kitsu) so stream addons work ----------
-let alToKitsu = new Map(), kitsuToAl = new Map(), alToImdb = new Map();
+let alToKitsu = new Map(), kitsuToAl = new Map(), alToImdb = new Map(), imdbToAl = new Map();
 async function loadMapping() {
   try {
     const list = await (await fetch(MAPPING_URL)).json();
-    const a = new Map(), k = new Map(), im = new Map();
+    const a = new Map(), k = new Map(), im = new Map(), ia = new Map();
     for (const e of list) {
       if (!e.anilist_id) continue;
       if (e.kitsu_id) { a.set(e.anilist_id, e.kitsu_id); k.set(e.kitsu_id, e.anilist_id); }
       const imdb = Array.isArray(e.imdb_id) ? e.imdb_id[0] : e.imdb_id;
-      if (imdb && /^tt\d+$/.test(imdb)) im.set(e.anilist_id, imdb);
+      if (imdb && /^tt\d+$/.test(imdb)) {
+        im.set(e.anilist_id, imdb);
+        // for a show with several seasons, keep the earliest season as its "main" AniList entry
+        const season = e.season?.tvdb ?? e.season?.tmdb ?? 1, cur = ia.get(imdb);
+        if (!cur || season < cur.season) ia.set(imdb, { al: e.anilist_id, season });
+      }
     }
-    alToKitsu = a; kitsuToAl = k; alToImdb = im;
+    alToKitsu = a; kitsuToAl = k; alToImdb = im; imdbToAl = ia;
     console.log(`Loaded ${a.size} AniList→Kitsu mappings`);
   } catch (e) { console.error('Mapping load failed:', e.message); }
 }
@@ -305,6 +312,47 @@ app.get('/meta/:type/:id.json', async (req, res) => {
     res.setHeader('Cache-Control', 'max-age=3600');
     res.json({ meta });
   } catch (e) { console.error(e); res.json({ meta: null }); }
+});
+
+// ---------- "Similar" picks, shown in the stream list ----------
+const RECS_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { recommendations(sort:RATING_DESC, perPage:12) {
+  nodes { rating mediaRecommendation { id format isAdult averageScore genres seasonYear startDate { year }
+    title { romaji english } } } } } }`;
+
+function anilistIdFor(id) {
+  const [prefix, num] = id.split(':');
+  if (id.startsWith('tt')) return imdbToAl.get(prefix)?.al;
+  if (prefix === 'kitsu') return kitsuToAl.get(+num);
+  if (prefix === 'anilist') return +num;
+}
+
+app.get('/stream/:type/:id.json', async (req, res) => {
+  try {
+    const alId = anilistIdFor(req.params.id);
+    if (!alId) return res.json({ streams: [] });
+    const data = await cached('recs:' + alId, 12 * 3600e3, () => anilist(RECS_QUERY, { id: alId }));
+    const seen = new Set([stremioId(alId)]);
+    const streams = [];
+    for (const n of data.Media?.recommendations?.nodes || []) {
+      const m = n.mediaRecommendation;
+      if (!m || m.isAdult || n.rating <= 0) continue;
+      const id = stremioId(m.id);
+      if (seen.has(id)) continue; // skip other seasons of the same show
+      seen.add(id);
+      const type = m.format === 'MOVIE' ? 'movie' : 'series';
+      const year = m.startDate?.year || m.seasonYear;
+      const info = [m.averageScore ? `★ ${(m.averageScore / 10).toFixed(1)}` : null, year, (m.genres || []).slice(0, 3).join(', ')]
+        .filter(Boolean).join(' · ');
+      const text = `${pickTitle(m.title)}\n${info}`;
+      streams.push({
+        name: '🔎 Similar', title: text, description: text,
+        externalUrl: `stremio:///detail/${type}/${encodeURIComponent(id)}`,
+      });
+      if (streams.length >= 8) break;
+    }
+    res.setHeader('Cache-Control', 'max-age=43200');
+    res.json({ streams });
+  } catch (e) { console.error(e); res.json({ streams: [] }); }
 });
 
 app.get('/poster/:data.jpg', async (req, res) => {
