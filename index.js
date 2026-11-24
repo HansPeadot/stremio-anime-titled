@@ -31,11 +31,12 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '2.1.0',
+  version: '2.2.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
   resources: ['catalog',
+    { name: 'stream', types: ['series', 'movie', 'anime'], idPrefixes: ['atpsim:'] },
     { name: 'meta', types: ['series', 'movie', 'anime'], idPrefixes: ['atp:', 'kitsu:', 'anilist:'] }],
   types: ['anime', 'series', 'movie'],
   catalogs: [
@@ -199,8 +200,8 @@ function fitTitle(text, width) {
   return { size: 24, lines: wrap(text, 24, width, 3).lines };
 }
 
-async function renderPoster({ t, i, r, e, dt, b }) {
-  const W = 400, H = 600, pad = 22, FONT = 'DejaVu Sans, Inter, Arial, sans-serif';
+async function renderPoster({ t, i, r, e, dt, b }, W = 400, H = 600) {
+  const pad = 22, FONT = 'DejaVu Sans, Inter, Arial, sans-serif';
   const coverBuf = Buffer.from(await (await fetch(i)).arrayBuffer());
   const { size, lines } = fitTitle(t, W - pad * 2);
   const lh = Math.round(size * 1.15);
@@ -347,30 +348,46 @@ async function cinemeta(type, imdb) {
 const SIMILAR_QUERY = `query ($search:String) { Page(perPage:1) { media(type:ANIME, search:$search, sort:[SEARCH_MATCH, POPULARITY_DESC], isAdult:false) {
   id recommendations(sort:RATING_DESC, perPage:25) { nodes { rating mediaRecommendation { isAdult ${LIST_FIELDS} } } } } } }`;
 const RECS_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { title { romaji english } recommendations(sort:RATING_DESC, perPage:16) {
-  nodes { rating mediaRecommendation { id format isAdult averageScore seasonYear title { romaji english } } } } } }`;
+  nodes { rating mediaRecommendation { id format isAdult averageScore seasonYear startDate { year }
+    title { romaji english } coverImage { extraLarge large } bannerImage } } } } }`;
 
-async function similarLinks(alId) {
+const SIM_SEASON = 100; // extra "season" at the end of the episode list that holds similar shows
+
+async function similar(alId) {
   const data = await cached('recs:' + alId, 12 * 3600e3, () => anilist(RECS_QUERY, { id: alId }));
-  const seen = new Set([stremioId(alId)]), links = [];
-  const own = data.Media?.title ? pickTitle(data.Media.title) : '';
-  if (own) links.push({ // opens Stremio search, where the "Similar Anime" row shows posters
-    name: '🖼 View with posters', category: 'Similar Anime',
-    url: `stremio:///search?search=${encodeURIComponent('similar: ' + own)}`,
-  });
+  const seen = new Set([stremioId(alId)]), items = [];
   for (const n of data.Media?.recommendations?.nodes || []) {
     const m = n.mediaRecommendation;
     if (!m || m.isAdult || n.rating <= 0) continue;
     const id = stremioId(m.id);
     if (seen.has(id)) continue; // other seasons of the same show
     seen.add(id);
-    const score = m.averageScore ? ` ★${(m.averageScore / 10).toFixed(1)}` : '';
-    links.push({
-      name: `${pickTitle(m.title)}${score}`, category: 'Similar Anime',
-      url: `stremio:///detail/${m.format === 'MOVIE' ? 'movie' : 'series'}/${encodeURIComponent(id)}`,
-    });
-    if (links.length >= 11) break;
+    items.push({ id, m, type: m.format === 'MOVIE' ? 'movie' : 'series', title: pickTitle(m.title),
+      score: m.averageScore ? (m.averageScore / 10).toFixed(1) : '', year: m.startDate?.year || m.seasonYear });
+    if (items.length >= 10) break;
   }
+  return { own: data.Media?.title ? pickTitle(data.Media.title) : '', items };
+}
+
+function similarLinks({ own, items }) {
+  const links = [];
+  if (own) links.push({ name: '🖼 View with posters', category: 'Similar Anime',
+    url: `stremio:///search?search=${encodeURIComponent('similar: ' + own)}` });
+  for (const x of items) links.push({ name: `${x.title}${x.score ? ' ★' + x.score : ''}`, category: 'Similar Anime',
+    url: `stremio:///detail/${x.type}/${encodeURIComponent(x.id)}` });
   return links;
+}
+
+// Similar shows as "episodes" of an extra season — the phone app shows these with pictures.
+function similarVideos({ items }, base) {
+  return items.map((x, k) => ({
+    id: `atpsim:${x.type}:${x.id}`,
+    title: `Similar: ${x.title}`, season: SIM_SEASON, episode: k + 1,
+    overview: [x.score && `★ ${x.score}`, x.year, (x.m.format || '').replace('_', ' ')].filter(Boolean).join(' · '),
+    thumbnail: `${base}/thumb/${b64({ t: x.title, i: x.m.bannerImage || x.m.coverImage.extraLarge || x.m.coverImage.large,
+      r: x.score, dt: x.year ? String(x.year) : '' })}.jpg`,
+    released: new Date(Date.UTC(x.year || 2000, 0, 1)).toISOString(),
+  }));
 }
 
 router.get('/meta/:type/:id.json', async (req, res) => {
@@ -399,12 +416,35 @@ router.get('/meta/:type/:id.json', async (req, res) => {
     if (!meta) return res.json({ meta: null });
 
     if (alId) {
-      const sim = await similarLinks(alId).catch(e => { console.error(e.message); return []; });
-      meta.links = [...(meta.links || []), ...sim];
+      const sim = await similar(alId).catch(e => { console.error(e.message); return null; });
+      if (sim?.items.length) {
+        meta.links = [...(meta.links || []), ...similarLinks(sim)];
+        if (Array.isArray(meta.videos) && meta.type === 'series') meta.videos = [...meta.videos, ...similarVideos(sim, base)];
+      }
     }
     res.setHeader('Cache-Control', 'max-age=600');
     res.json({ meta });
   } catch (e) { console.error(e); res.json({ meta: null }); }
+});
+
+router.get('/stream/:type/:id.json', (req, res) => {
+  const m = req.params.id.match(/^atpsim:(series|movie):(.+)$/);
+  if (!m) return res.json({ streams: [] });
+  res.setHeader('Cache-Control', 'max-age=86400');
+  res.json({ streams: [{ name: '▶ Open', title: 'Open this anime', description: 'Open this anime',
+    externalUrl: `stremio:///detail/${m[1]}/${encodeURIComponent(m[2])}` }] });
+});
+
+router.get('/thumb/:data.jpg', async (req, res) => {
+  try {
+    const raw = req.params.data;
+    const d = JSON.parse(Buffer.from(raw, 'base64url').toString());
+    if (!/^https:\/\/s4\.anilist\.co\//.test(d.i)) return res.status(400).end();
+    const img = await cached('thumb:' + raw, 6 * 3600e3, () => renderPoster(d, 640, 360));
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=21600');
+    res.end(img);
+  } catch (e) { console.error(e); res.status(500).end(); }
 });
 
 router.get('/poster/:data.jpg', async (req, res) => {
