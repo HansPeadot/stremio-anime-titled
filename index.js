@@ -120,7 +120,7 @@ function toMetaPreview(m, base, type) {
   const img = m.coverImage.extraLarge || m.coverImage.large;
   return {
     id: stremioId(m.id), type, name: title,
-    poster: `${base}/poster/${m.id}.jpg?d=${b64({ t: title, i: img, b: badgeFor(m) })}`,
+    poster: `${base}/poster/${b64({ t: title, i: img, b: badgeFor(m) })}.jpg`,
     posterShape: 'poster', genres: m.genres,
     description: cleanDesc(m.description),
     releaseInfo: m.seasonYear ? String(m.seasonYear) : undefined,
@@ -276,11 +276,12 @@ app.get('/meta/:type/:id.json', async (req, res) => {
   } catch (e) { console.error(e); res.json({ meta: null }); }
 });
 
-app.get('/poster/:alId.jpg', async (req, res) => {
+app.get('/poster/:data.jpg', async (req, res) => {
   try {
-    const d = JSON.parse(Buffer.from(req.query.d, 'base64url').toString());
+    const raw = req.params.data;
+    const d = JSON.parse(Buffer.from(raw, 'base64url').toString());
     if (!/^https:\/\/s4\.anilist\.co\//.test(d.i)) return res.status(400).end();
-    const img = await cached('img:' + req.query.d, 6 * 3600e3, () => renderPoster(d));
+    const img = await cached('img:' + raw, 6 * 3600e3, () => renderPoster(d));
     res.setHeader('Content-Type', 'image/jpeg');
     res.setHeader('Cache-Control', 'public, max-age=21600');
     res.end(img);
