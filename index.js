@@ -31,7 +31,7 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '1.4.0',
+  version: '1.5.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
@@ -45,6 +45,7 @@ const manifest = {
       extra: [{ name: 'genre', options: GENRES }, { name: 'skip' }],
     })),
     { type: 'anime', id: 'al_search', name: 'Anime Search', extra: [{ name: 'search', isRequired: true }] },
+    { type: 'anime', id: 'al_similar', name: 'Similar Anime', extra: [{ name: 'search', isRequired: true }] },
   ],
   behaviorHints: { configurable: false },
 };
@@ -253,6 +254,23 @@ app.get('/catalog/:type/:id{/:extra}', async (req, res) => {
     const extra = parseExtra(req.params.extra);
     const page = Math.round((+extra.skip || 0) / PER_PAGE) + 1; // tolerant of de-duplicated pages
     let vars, type = 'series';
+    if (id === 'al_similar') {
+      if (!extra.search) return res.json({ metas: [] });
+      const recs = await cached('sim:' + extra.search.toLowerCase(), 12 * 3600e3, () => anilist(SIMILAR_QUERY, { search: extra.search }));
+      const base = baseUrl(req), media = recs.Page.media[0];
+      if (!media) return res.json({ metas: [] });
+      const seen = new Set([stremioId(media.id)]);
+      const metas = [];
+      for (const n of media.recommendations.nodes) {
+        const m = n.mediaRecommendation;
+        if (!m || m.isAdult || n.rating <= 0) continue;
+        const meta = toMetaPreview(m, base, m.format === 'MOVIE' ? 'movie' : 'series');
+        if (seen.has(meta.id)) continue;
+        seen.add(meta.id); metas.push(meta);
+      }
+      res.setHeader('Cache-Control', 'max-age=43200');
+      return res.json({ metas });
+    }
     if (id === 'al_search') {
       if (!extra.search) return res.json({ metas: [] });
       vars = { search: extra.search, sort: ['SEARCH_MATCH'] };
@@ -313,6 +331,9 @@ app.get('/meta/:type/:id.json', async (req, res) => {
     res.json({ meta });
   } catch (e) { console.error(e); res.json({ meta: null }); }
 });
+
+const SIMILAR_QUERY = `query ($search:String) { Page(perPage:1) { media(type:ANIME, search:$search, sort:[SEARCH_MATCH, POPULARITY_DESC], isAdult:false) {
+  id recommendations(sort:RATING_DESC, perPage:25) { nodes { rating mediaRecommendation { isAdult ${LIST_FIELDS} } } } } } }`;
 
 // ---------- "Similar" picks, shown in the stream list ----------
 const RECS_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { recommendations(sort:RATING_DESC, perPage:12) {
