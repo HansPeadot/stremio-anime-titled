@@ -255,7 +255,10 @@ app.get('/catalog/:type/:id{/:extra}', async (req, res) => {
     const extra = parseExtra(req.params.extra);
     const page = Math.round((+extra.skip || 0) / PER_PAGE) + 1; // tolerant of de-duplicated pages
     let vars, type = 'series';
+    const simPrefix = /^\s*similar\s*:\s*/i;
+    if (id === 'al_search' && simPrefix.test(extra.search || '')) return res.json({ metas: [] });
     if (id === 'al_similar') {
+      if (extra.search) extra.search = extra.search.replace(simPrefix, '');
       if (!extra.search) return res.json({ metas: [] });
       const recs = await cached('sim:' + extra.search.toLowerCase(), 12 * 3600e3, () => anilist(SIMILAR_QUERY, { search: extra.search }));
       const base = baseUrl(req), media = recs.Page.media[0];
@@ -335,12 +338,17 @@ async function cinemeta(type, imdb) {
 // ---------- "Similar Anime" (AniList community recommendations) ----------
 const SIMILAR_QUERY = `query ($search:String) { Page(perPage:1) { media(type:ANIME, search:$search, sort:[SEARCH_MATCH, POPULARITY_DESC], isAdult:false) {
   id recommendations(sort:RATING_DESC, perPage:25) { nodes { rating mediaRecommendation { isAdult ${LIST_FIELDS} } } } } } }`;
-const RECS_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { recommendations(sort:RATING_DESC, perPage:16) {
+const RECS_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { title { romaji english } recommendations(sort:RATING_DESC, perPage:16) {
   nodes { rating mediaRecommendation { id format isAdult averageScore seasonYear title { romaji english } } } } } }`;
 
 async function similarLinks(alId) {
   const data = await cached('recs:' + alId, 12 * 3600e3, () => anilist(RECS_QUERY, { id: alId }));
   const seen = new Set([stremioId(alId)]), links = [];
+  const own = data.Media?.title ? pickTitle(data.Media.title) : '';
+  if (own) links.push({ // opens Stremio search, where the "Similar Anime" row shows posters
+    name: '🖼 View with posters', category: 'Similar Anime',
+    url: `stremio:///search?search=${encodeURIComponent('similar: ' + own)}`,
+  });
   for (const n of data.Media?.recommendations?.nodes || []) {
     const m = n.mediaRecommendation;
     if (!m || m.isAdult || n.rating <= 0) continue;
@@ -352,7 +360,7 @@ async function similarLinks(alId) {
       name: `${pickTitle(m.title)}${score}`, category: 'Similar Anime',
       url: `stremio:///detail/${m.format === 'MOVIE' ? 'movie' : 'series'}/${encodeURIComponent(id)}`,
     });
-    if (links.length >= 10) break;
+    if (links.length >= 11) break;
   }
   return links;
 }
