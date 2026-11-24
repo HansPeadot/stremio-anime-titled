@@ -31,7 +31,7 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '2.0.0',
+  version: '2.1.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
@@ -147,6 +147,8 @@ function toMetaPreview(m, base, type) {
     description: cleanDesc(m.description),
     releaseInfo: m.seasonYear ? String(m.seasonYear) : undefined,
     imdbRating: m.averageScore ? (m.averageScore / 10).toFixed(1) : undefined,
+    links: [{ name: '🖼 Similar anime', category: 'Similar Anime',
+      url: `stremio:///search?search=${encodeURIComponent('similar: ' + title)}` }],
   };
 }
 
@@ -240,10 +242,11 @@ async function renderPoster({ t, i, r, e, dt, b }) {
 
 // ---------- server ----------
 const app = express();
+const router = express.Router();
 app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', '*'); next(); });
 
-app.get('/', (req, res) => {
-  const url = `${baseUrl(req)}/manifest.json`;
+router.get('/', (req, res) => {
+  const url = `${baseUrl(req)}/v2/manifest.json`;
   res.send(`<html><body style="font-family:sans-serif;background:#141320;color:#eee;padding:40px;text-align:center">
     <h2>${manifest.name}</h2><p>${manifest.description}</p>
     <p><a style="background:#7b5bf5;color:#fff;padding:14px 26px;border-radius:10px;text-decoration:none"
@@ -251,9 +254,9 @@ app.get('/', (req, res) => {
     <p>Or paste into Stremio's addon search:<br><code>${url}</code></p></body></html>`);
 });
 
-app.get('/manifest.json', (req, res) => res.json(manifest));
+router.get('/manifest.json', (req, res) => res.json(manifest));
 
-app.get('/catalog/:type/:id{/:extra}', async (req, res) => {
+router.get('/catalog/:type/:id{/:extra}', async (req, res) => {
   try {
     const id = req.params.id.replace(/\.json$/, '');
     const extra = parseExtra(req.params.extra);
@@ -303,6 +306,7 @@ async function buildAnilistMeta(alId, id, base, videoPrefix) {
   const { Media: m } = await cached('meta:' + alId, 60 * 60e3, () => anilist(META_QUERY, { id: alId }));
   const meta = toMetaPreview(m, base, m.format === 'MOVIE' ? 'movie' : 'series');
   meta.id = id;
+  meta.links = []; // full page gets its own Similar list
   meta.background = m.bannerImage || m.coverImage.extraLarge;
   meta.runtime = m.duration ? `${m.duration} min` : undefined;
   if (m.startDate?.year) meta.released = new Date(Date.UTC(m.startDate.year, (m.startDate.month || 1) - 1, m.startDate.day || 1)).toISOString();
@@ -369,7 +373,7 @@ async function similarLinks(alId) {
   return links;
 }
 
-app.get('/meta/:type/:id.json', async (req, res) => {
+router.get('/meta/:type/:id.json', async (req, res) => {
   try {
     const { id } = req.params, base = baseUrl(req);
     let meta = null, alId;
@@ -398,12 +402,12 @@ app.get('/meta/:type/:id.json', async (req, res) => {
       const sim = await similarLinks(alId).catch(e => { console.error(e.message); return []; });
       meta.links = [...(meta.links || []), ...sim];
     }
-    res.setHeader('Cache-Control', 'max-age=3600');
+    res.setHeader('Cache-Control', 'max-age=600');
     res.json({ meta });
   } catch (e) { console.error(e); res.json({ meta: null }); }
 });
 
-app.get('/poster/:data.jpg', async (req, res) => {
+router.get('/poster/:data.jpg', async (req, res) => {
   try {
     const raw = req.params.data;
     const d = JSON.parse(Buffer.from(raw, 'base64url').toString());
@@ -417,5 +421,7 @@ app.get('/poster/:data.jpg', async (req, res) => {
 
 loadMapping();
 setInterval(loadMapping, 24 * 3600e3);
+app.use('/v2', router);
+app.use('/', router);
 if (require.main === module) app.listen(PORT, () => console.log(`Addon running: http://localhost:${PORT}/manifest.json`));
 module.exports = { renderPoster, fitTitle };
