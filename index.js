@@ -387,6 +387,9 @@ function similarVideos({ items }, base) {
     thumbnail: `${base}/thumb/${b64({ t: x.title, i: x.m.bannerImage || x.m.coverImage.extraLarge || x.m.coverImage.large,
       r: x.score, dt: x.year ? String(x.year) : '' })}.jpg`,
     released: new Date(Date.UTC(x.year || 2000, 0, 1)).toISOString(),
+    // the link is built into the "episode", so tapping it lists only this one entry (no stream search)
+    streams: [{ name: '▶ Open', title: `Open ${x.title}`, description: `Open ${x.title}`,
+      externalUrl: `stremio:///detail/${x.type}/${encodeURIComponent(x.id)}` }],
   }));
 }
 
@@ -428,6 +431,7 @@ router.get('/meta/:type/:id.json', async (req, res) => {
 });
 
 router.get('/stream/:type/:id.json', (req, res) => {
+  console.log('similar stream request', req.params.id);
   const m = req.params.id.match(/^atpsim:(series|movie):(.+)$/);
   if (!m) return res.json({ streams: [] });
   res.setHeader('Cache-Control', 'max-age=86400');
