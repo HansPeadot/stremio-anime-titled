@@ -388,7 +388,7 @@ function similarVideos({ items }, base) {
       r: x.score, dt: x.year ? String(x.year) : '' })}.jpg`,
     released: new Date(Date.UTC(x.year || 2000, 0, 1)).toISOString(),
     // the link is built into the "episode", so tapping it lists only this one entry (no stream search)
-    streams: [{ name: '▶ Open', title: `Open ${x.title}`, description: `Open ${x.title}`,
+    streams: [{ name: '▶ Open', title: `Open ${x.title}`,
       externalUrl: `stremio:///detail/${x.type}/${encodeURIComponent(x.id)}` }],
   }));
 }
@@ -435,7 +435,7 @@ router.get('/stream/:type/:id.json', (req, res) => {
   const m = req.params.id.match(/^atpsim:(series|movie):(.+)$/);
   if (!m) return res.json({ streams: [] });
   res.setHeader('Cache-Control', 'max-age=86400');
-  res.json({ streams: [{ name: '▶ Open', title: 'Open this anime', description: 'Open this anime',
+  res.json({ streams: [{ name: '▶ Open', title: 'Open this anime',
     externalUrl: `stremio:///detail/${m[1]}/${encodeURIComponent(m[2])}` }] });
 });
 
