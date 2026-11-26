@@ -91,7 +91,7 @@ const META_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { ${LIST_FIELDS}
   trailer { id site } streamingEpisodes { title thumbnail } airingSchedule(perPage:50) { nodes { episode airingAt } } } }`;
 
 // ---------- ID mapping (AniList <-> Kitsu) so stream addons work ----------
-let alToKitsu = new Map(), kitsuToAl = new Map(), alToImdb = new Map(), imdbToAl = new Map();
+let alToKitsu = new Map(), kitsuToAl = new Map(), alToImdb = new Map(), imdbToAl = new Map(), imdbSeasons = new Map();
 // ---------- English dub info (community list from github.com/MAL-Dubs/MAL-Dubs, keyed by MAL id) ----------
 const DUBS_URL = 'https://raw.githubusercontent.com/MAL-Dubs/MAL-Dubs/main/data/dubInfo.json';
 let dubbed = new Set(), dubPartial = new Set(), alToMal = new Map();
@@ -112,7 +112,7 @@ function dubStatus(alId, malId) {
 async function loadMapping() {
   try {
     const list = await (await fetch(MAPPING_URL)).json();
-    const a = new Map(), k = new Map(), im = new Map(), ia = new Map();
+    const a = new Map(), k = new Map(), im = new Map(), ia = new Map(), is = new Map();
     for (const e of list) {
       if (!e.anilist_id) continue;
       if (e.kitsu_id) { a.set(e.anilist_id, e.kitsu_id); k.set(e.kitsu_id, e.anilist_id); }
@@ -127,9 +127,15 @@ async function loadMapping() {
         const rank = typeRank * 1000 + (season >= 1 ? season : 999);
         const cur = ia.get(imdb);
         if (!cur || rank < cur.rank) ia.set(imdb, { al: e.anilist_id, rank });
+        // every TV-style season of the show, for per-season dub info
+        if (typeRank <= 1 && e.type !== 'MOVIE' && season >= 1) {
+          if (!is.has(imdb)) is.set(imdb, new Map());
+          const bySeason = is.get(imdb);
+          if (!bySeason.has(season)) bySeason.set(season, e.anilist_id);
+        }
       }
     }
-    alToKitsu = a; kitsuToAl = k; alToImdb = im; imdbToAl = ia;
+    alToKitsu = a; kitsuToAl = k; alToImdb = im; imdbToAl = ia; imdbSeasons = is;
     console.log(`Loaded ${a.size} AniList→Kitsu mappings`);
   } catch (e) { console.error('Mapping load failed:', e.message); }
 }
@@ -442,8 +448,15 @@ router.get('/meta/:type/:id.json', async (req, res) => {
     if (!meta) return res.json({ meta: null });
 
     if (alId) {
-      const ds = dubStatus(alId);
-      const note = ds === 'full' ? '🎙️ English dub available' : ds === 'part' ? '🎙️ English dub (partial / in progress)' : '🎙️ No English dub (sub only)';
+      const seasons = id.startsWith('atp:tt') ? [...(imdbSeasons.get(id.slice(4)) || new Map())].sort((x, y) => x[0] - y[0]) : [];
+      let note;
+      if (seasons.length > 1) { // one line per season
+        const mark = st => (st === 'full' ? '✅ Dub' : st === 'part' ? '🟡 Dub in progress' : '❌ Sub only');
+        note = '🎙️ English dub by season:\n' + seasons.map(([n, al]) => `Season ${n}: ${mark(dubStatus(al))}`).join('\n');
+      } else {
+        const ds = dubStatus(alId);
+        note = ds === 'full' ? '🎙️ English dub available' : ds === 'part' ? '🎙️ English dub (partial / in progress)' : '🎙️ No English dub (sub only)';
+      }
       meta.description = `${note}\n\n${meta.description || ''}`.trim();
       const sim = await similar(alId).catch(e => { console.error(e.message); return null; });
       if (sim?.items.length) {
