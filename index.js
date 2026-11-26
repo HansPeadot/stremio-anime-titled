@@ -31,7 +31,7 @@ const CATALOGS = {
 
 const manifest = {
   id: 'community.anilist.titled',
-  version: '2.2.0',
+  version: '2.3.0',
   name: 'Anime Catalogs (Titled Posters)',
   description: 'AniList anime catalogs — Airing, Trending, Popular, Top Rated, This Season, Upcoming — with the title printed on every poster.',
   logo: 'https://anilist.co/img/icons/android-chrome-512x512.png',
@@ -92,6 +92,23 @@ const META_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { ${LIST_FIELDS}
 
 // ---------- ID mapping (AniList <-> Kitsu) so stream addons work ----------
 let alToKitsu = new Map(), kitsuToAl = new Map(), alToImdb = new Map(), imdbToAl = new Map();
+// ---------- English dub info (community list from github.com/MAL-Dubs/MAL-Dubs, keyed by MAL id) ----------
+const DUBS_URL = 'https://raw.githubusercontent.com/MAL-Dubs/MAL-Dubs/main/data/dubInfo.json';
+let dubbed = new Set(), dubPartial = new Set(), alToMal = new Map();
+async function loadDubs() {
+  try {
+    const d = await (await fetch(DUBS_URL)).json();
+    dubbed = new Set(d.dubbed); dubPartial = new Set(d.incomplete || []);
+    console.log(`Loaded ${dubbed.size} English-dubbed anime`);
+  } catch (e) { console.error('Dub list load failed:', e.message); }
+}
+// 'full' | 'part' | '' for an AniList entry
+function dubStatus(alId, malId) {
+  const mal = malId || alToMal.get(alId);
+  if (!mal) return '';
+  return dubbed.has(mal) ? 'full' : dubPartial.has(mal) ? 'part' : '';
+}
+
 async function loadMapping() {
   try {
     const list = await (await fetch(MAPPING_URL)).json();
@@ -99,6 +116,7 @@ async function loadMapping() {
     for (const e of list) {
       if (!e.anilist_id) continue;
       if (e.kitsu_id) { a.set(e.anilist_id, e.kitsu_id); k.set(e.kitsu_id, e.anilist_id); }
+      if (e.mal_id) alToMal.set(e.anilist_id, e.mal_id);
       const imdb = Array.isArray(e.imdb_id) ? e.imdb_id[0] : e.imdb_id;
       if (imdb && /^tt\d+$/.test(imdb)) {
         im.set(e.anilist_id, imdb);
@@ -143,7 +161,7 @@ function toMetaPreview(m, base, type) {
   return {
     id: stremioId(m.id), type, name: title,
     poster: `${base}/poster/${b64({ t: title, i: img, r: m.averageScore ? (m.averageScore / 10).toFixed(1) : '',
-      e: airingBadge(m), dt: dateLabel(m) })}.jpg`,
+      e: airingBadge(m), dt: dateLabel(m), d: dubStatus(m.id, m.idMal) })}.jpg`,
     posterShape: 'poster', genres: m.genres,
     description: cleanDesc(m.description),
     releaseInfo: m.seasonYear ? String(m.seasonYear) : undefined,
@@ -200,7 +218,7 @@ function fitTitle(text, width) {
   return { size: 24, lines: wrap(text, 24, width, 3).lines };
 }
 
-async function renderPoster({ t, i, r, e, dt, b }, W = 400, H = 600) {
+async function renderPoster({ t, i, r, e, dt, b, d }, W = 400, H = 600) {
   const pad = 22, FONT = 'DejaVu Sans, Inter, Arial, sans-serif';
   const coverBuf = Buffer.from(await (await fetch(i)).arrayBuffer());
   const { size, lines } = fitTitle(t, W - pad * 2);
@@ -235,7 +253,12 @@ async function renderPoster({ t, i, r, e, dt, b }, W = 400, H = 600) {
     ${top}
     <text font-family="${FONT}" font-size="${size}" font-weight="800" fill="#fff" filter="url(#s)">${tspans}</text>
     ${dt ? `<text x="${pad}" y="${H - pad - 4}" font-family="${FONT}" font-size="24" font-weight="600"
-      fill="#d8d8e0" filter="url(#s)">${esc(dt)}</text>` : ''}</svg>`;
+      fill="#d8d8e0" filter="url(#s)">${esc(dt)}</text>` : ''}
+    ${d ? (() => { // English dub tag, bottom-right on the year line
+      const label = d === 'part' ? 'EN DUB*' : 'EN DUB', w = Math.round(label.length * 13 + 22);
+      return `<rect x="${W - pad - w}" y="${H - pad - 30}" rx="8" width="${w}" height="32" fill="#1f9d55"/>
+        <text x="${W - pad - w / 2}" y="${H - pad - 7}" text-anchor="middle" font-family="${FONT}" font-size="19"
+          font-weight="800" fill="#fff">${label}</text>`; })() : ''}</svg>`;
 
   return sharp(coverBuf).resize(W, H, { fit: 'cover', position: 'attention' })
     .composite([{ input: Buffer.from(svg) }]).jpeg({ quality: 82 }).toBuffer();
@@ -348,7 +371,7 @@ async function cinemeta(type, imdb) {
 const SIMILAR_QUERY = `query ($search:String) { Page(perPage:1) { media(type:ANIME, search:$search, sort:[SEARCH_MATCH, POPULARITY_DESC], isAdult:false) {
   id recommendations(sort:RATING_DESC, perPage:25) { nodes { rating mediaRecommendation { isAdult ${LIST_FIELDS} } } } } } }`;
 const RECS_QUERY = `query ($id:Int) { Media(id:$id, type:ANIME) { title { romaji english } recommendations(sort:RATING_DESC, perPage:16) {
-  nodes { rating mediaRecommendation { id format isAdult averageScore seasonYear startDate { year }
+  nodes { rating mediaRecommendation { id idMal format isAdult averageScore seasonYear startDate { year }
     title { romaji english } coverImage { extraLarge large } bannerImage } } } } }`;
 
 const SIM_SEASON = 100; // extra "season" at the end of the episode list that holds similar shows
@@ -385,7 +408,7 @@ function similarVideos({ items }, base) {
     title: `Similar: ${x.title}`, season: SIM_SEASON, episode: k + 1,
     overview: [x.score && `★ ${x.score}`, x.year, (x.m.format || '').replace('_', ' ')].filter(Boolean).join(' · '),
     thumbnail: `${base}/thumb/${b64({ t: x.title, i: x.m.bannerImage || x.m.coverImage.extraLarge || x.m.coverImage.large,
-      r: x.score, dt: x.year ? String(x.year) : '' })}.jpg`,
+      r: x.score, dt: x.year ? String(x.year) : '', d: dubStatus(x.m.id, x.m.idMal) })}.jpg`,
     released: new Date(Date.UTC(x.year || 2000, 0, 1)).toISOString(),
     // the link is built into the "episode", so tapping it lists only this one entry (no stream search)
     streams: [{ name: '▶ Open', title: `Open ${x.title}`,
@@ -419,6 +442,9 @@ router.get('/meta/:type/:id.json', async (req, res) => {
     if (!meta) return res.json({ meta: null });
 
     if (alId) {
+      const ds = dubStatus(alId);
+      const note = ds === 'full' ? '🎙️ English dub available' : ds === 'part' ? '🎙️ English dub (partial / in progress)' : '🎙️ No English dub (sub only)';
+      meta.description = `${note}\n\n${meta.description || ''}`.trim();
       const sim = await similar(alId).catch(e => { console.error(e.message); return null; });
       if (sim?.items.length) {
         meta.links = [...(meta.links || []), ...similarLinks(sim)];
@@ -463,8 +489,8 @@ router.get('/poster/:data.jpg', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).end(); }
 });
 
-loadMapping();
-setInterval(loadMapping, 24 * 3600e3);
+loadMapping(); loadDubs();
+setInterval(() => { loadMapping(); loadDubs(); }, 24 * 3600e3);
 app.use('/v2', router);
 app.use('/', router);
 if (require.main === module) app.listen(PORT, () => console.log(`Addon running: http://localhost:${PORT}/manifest.json`));
