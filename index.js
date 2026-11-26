@@ -327,7 +327,7 @@ router.get('/catalog/:type/:id{/:extra}', async (req, res) => {
     const seen = new Set();
     const metas = data.Page.media.map(m => toMetaPreview(m, base, m.format === 'MOVIE' ? 'movie' : type))
       .filter(x => !seen.has(x.id) && seen.add(x.id)); // seasons of one show share an IMDb id
-    res.setHeader('Cache-Control', 'max-age=1800');
+    res.setHeader('Cache-Control', 'max-age=300');
     res.json({ metas });
   } catch (e) { console.error(e); res.json({ metas: [] }); }
 });
@@ -464,7 +464,7 @@ router.get('/meta/:type/:id.json', async (req, res) => {
         if (Array.isArray(meta.videos) && meta.type === 'series') meta.videos = [...meta.videos, ...similarVideos(sim, base)];
       }
     }
-    res.setHeader('Cache-Control', 'max-age=600');
+    res.setHeader('Cache-Control', 'max-age=120');
     res.json({ meta });
   } catch (e) { console.error(e); res.json({ meta: null }); }
 });
